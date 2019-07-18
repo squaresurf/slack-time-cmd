@@ -1,69 +1,58 @@
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE TemplateHaskell #-}
+{-# LANGUAGE RecordWildCards #-}
 module Slack
-  ( channelTimes
+  ( allUsersReq
+  , channelSlackIDs
   )
 where
 
-import qualified Time
-import           Control.Concurrent.Async       ( mapConcurrently )
-import qualified Data.Aeson.TH                 as JSONTH
+import qualified Data.ByteString.Char8         as B8
+import           Control.Concurrent             ( threadDelay )
+import           Data.Aeson
+import           Data.Foldable                  ( asum )
 import           Data.Function                  ( (&) )
-import           Data.List                      ( sortOn )
-import qualified Data.Set                      as Set
 import qualified Network.HTTP.Simple           as HTTP
 
-type MemberList = [String]
+import qualified Db
 
-newtype TestResp = TestResp
-  { ok :: Bool
-  } deriving (Show)
-$(JSONTH.deriveJSON JSONTH.defaultOptions ''TestResp)
+type MemberList = [String]
 
 newtype Channel = Channel
   { members :: MemberList
   } deriving (Show)
-$(JSONTH.deriveJSON JSONTH.defaultOptions ''Channel)
 
-newtype ChannelResp = ChannelResp
-  { channel :: Channel
+instance FromJSON Channel where
+  parseJSON (Object v) = do
+    channel <- v .: "channel"
+    members <- channel .: "members"
+    return Channel { .. }
+
+data AllUsersResp = AllUsersResp
+  { users :: [Db.SlackUser]
+  , next_cursor :: Maybe String
   } deriving (Show)
-$(JSONTH.deriveJSON JSONTH.defaultOptions ''ChannelResp)
 
-data User = User
-  { deleted :: Bool
-  , tz_label :: Maybe String
-  , tz_offset :: Maybe Int
-  } deriving (Show)
-$(JSONTH.deriveJSON JSONTH.defaultOptions ''User)
+instance FromJSON AllUsersResp where
+  parseJSON (Object v) = do
+    members     <- v .: "members"
+    users       <- parseJSON (Array members)
+    next_cursor <- asum
+      [ do
+        m <- v .: "response_metadata"
+        m .:? "next_cursor"
+      , return Nothing
+      ]
+    return AllUsersResp { .. }
 
-newtype UserResp = UserResp
-  { user :: User
-  } deriving (Show)
-$(JSONTH.deriveJSON JSONTH.defaultOptions ''UserResp)
-
-data TimeZone = TimeZone
-  { tzLabel :: String
-  , tzOffset :: Int
-  } deriving (Eq, Ord, Show)
-
-channelTimes :: String -> String -> IO [String]
-channelTimes token channel = do
-  chanResp      <- channelInfoReq token channel
-  userResponses <- getUsers token chanResp
-  userResponses
-    & fmap user
-    & filter (not . deleted)
-    & fmap userToTimezone
-    & sortOn (\u -> (tzOffset u, tzLabel u))
-    & Set.fromAscList
-    & Set.toList
-    & mapM timezoneToTime
+channelSlackIDs :: String -> String -> IO [String]
+channelSlackIDs token channel = do
+  chanResp <- channelInfoReq token channel
+  return $ members chanResp
 
 slackAPI :: String
 slackAPI = "https://slack.com/api/"
 
-channelInfoReq :: String -> String -> IO ChannelResp
+channelInfoReq :: String -> String -> IO Channel
 channelInfoReq token channel = do
   resp <- HTTP.httpJSON
     (HTTP.parseRequest_ $ concat
@@ -71,23 +60,37 @@ channelInfoReq token channel = do
     )
   return (HTTP.getResponseBody resp)
 
-userInfoReq :: String -> String -> IO UserResp
-userInfoReq token user = do
-  resp <- HTTP.httpJSON
-    ( HTTP.parseRequest_
-    $ concat [slackAPI, "users.info", "?token=", token, "&user=", user]
-    )
-  return (HTTP.getResponseBody resp)
+allUsersReqURL :: String -> Maybe String -> [String]
+allUsersReqURL token Nothing =
+  [slackAPI, "users.list", "?token=", token, "&include_locale=true&limit=200"]
+allUsersReqURL token (Just cursor) =
+  allUsersReqURL token Nothing <> ["&cursor=", cursor]
 
-getUsers :: String -> ChannelResp -> IO [UserResp]
-getUsers token ChannelResp { channel = Channel { members = members } } =
-  mapConcurrently (userInfoReq token) members
+allUsersReq :: String -> IO [Db.SlackUser]
+allUsersReq token = do
+  resp <- doRequestAllUsers $ concat $ allUsersReqURL token Nothing
+  allUsersReq_ token resp
 
-userToTimezone :: User -> TimeZone
-userToTimezone User { tz_label = Just label, tz_offset = Just offset } =
-  TimeZone { tzLabel = label, tzOffset = offset }
+allUsersReq_ :: String -> AllUsersResp -> IO [Db.SlackUser]
+allUsersReq_ token AllUsersResp { next_cursor = Nothing, users = users } =
+  return users
+allUsersReq_ token AllUsersResp { next_cursor = Just "", users = users } =
+  return users
+allUsersReq_ token AllUsersResp { next_cursor = Just cursor, users = users } =
+  do
+    resp      <- doRequestAllUsers $ concat $ allUsersReqURL token (Just cursor)
+    nextUsers <- allUsersReq_ token resp
+    return $ users <> nextUsers
 
-timezoneToTime :: TimeZone -> IO String
-timezoneToTime TimeZone { tzLabel = label, tzOffset = offset } = do
-  timeString <- Time.getCurrentTimeWithOffset offset
-  return $ concat [timeString, " : ", label]
+doRequestAllUsers :: String -> IO AllUsersResp
+doRequestAllUsers url = do
+  resp <- HTTP.httpJSONEither $ HTTP.parseRequest_ url
+  case HTTP.getResponseBody resp of
+    Left err -> case HTTP.getResponseStatusCode resp of
+      429 -> do
+        let retryAfter = read
+              (B8.unpack (head (HTTP.getResponseHeader "Retry-After" resp)))
+        threadDelay $ retryAfter * 1000000
+        doRequestAllUsers url
+      status -> error $ "uncatchable error: " <> show (status, err)
+    Right allUsersResp -> return allUsersResp

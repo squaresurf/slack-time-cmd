@@ -8,3 +8,9 @@ services:
       - SLACK_OAUTH_TOKEN
     ports:
       - "1234:1234"
+  db:
+    image: postgres:11.4-alpine
+    environment:
+      - POSTGRES_DB=slack_time_cmd
+    ports:
+     - "5432:5432"
