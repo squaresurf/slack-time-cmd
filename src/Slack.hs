@@ -2,30 +2,29 @@
 {-# LANGUAGE RecordWildCards #-}
 module Slack
   ( allUsersReq
-  , channelSlackIDs
+  , conversationMembersReq
   )
 where
 
 import qualified Data.ByteString.Char8         as B8
 import           Control.Concurrent             ( threadDelay )
 import           Data.Aeson
+import           Data.Aeson.Types               ( Parser )
 import           Data.Foldable                  ( asum )
 import           Data.Function                  ( (&) )
 import qualified Network.HTTP.Simple           as HTTP
 
 import qualified Db
 
-type MemberList = [String]
+newtype MemberList =
+  MemberList (Maybe String, [String])
+  deriving (Show)
 
-newtype Channel = Channel
-  { members :: MemberList
-  } deriving (Show)
-
-instance FromJSON Channel where
+instance FromJSON MemberList where
   parseJSON (Object v) = do
-    channel <- v .: "channel"
-    members <- channel .: "members"
-    return Channel { .. }
+    members    <- v .: "members"
+    nextCursor <- nextCursor (Object v)
+    return $ MemberList (nextCursor, members)
 
 data AllUsersResp = AllUsersResp
   { users :: [Db.SlackUser]
@@ -36,29 +35,20 @@ instance FromJSON AllUsersResp where
   parseJSON (Object v) = do
     members     <- v .: "members"
     users       <- parseJSON (Array members)
-    next_cursor <- asum
-      [ do
-        m <- v .: "response_metadata"
-        m .:? "next_cursor"
-      , return Nothing
-      ]
+    next_cursor <- nextCursor (Object v)
     return AllUsersResp { .. }
 
-channelSlackIDs :: String -> String -> IO [String]
-channelSlackIDs token channel = do
-  chanResp <- channelInfoReq token channel
-  return $ members chanResp
+nextCursor :: Value -> Parser (Maybe String)
+nextCursor (Object v) = asum
+  [ do
+    m <- v .: "response_metadata"
+    c <- m .: "next_cursor"
+    if c == "" then fail "empty string" else return (Just c)
+  , return Nothing
+  ]
 
 slackAPI :: String
 slackAPI = "https://slack.com/api/"
-
-channelInfoReq :: String -> String -> IO Channel
-channelInfoReq token channel = do
-  resp <- HTTP.httpJSON
-    (HTTP.parseRequest_ $ concat
-      [slackAPI, "channels.info", "?token=", token, "&channel=", channel]
-    )
-  return (HTTP.getResponseBody resp)
 
 allUsersReqURL :: String -> Maybe String -> [String]
 allUsersReqURL token Nothing =
@@ -73,8 +63,6 @@ allUsersReq token = do
 
 allUsersReq_ :: String -> AllUsersResp -> IO [Db.SlackUser]
 allUsersReq_ token AllUsersResp { next_cursor = Nothing, users = users } =
-  return users
-allUsersReq_ token AllUsersResp { next_cursor = Just "", users = users } =
   return users
 allUsersReq_ token AllUsersResp { next_cursor = Just cursor, users = users } =
   do
@@ -94,3 +82,47 @@ doRequestAllUsers url = do
         doRequestAllUsers url
       status -> error $ "uncatchable error: " <> show (status, err)
     Right allUsersResp -> return allUsersResp
+
+conversationMembersReqURL :: String -> String -> Maybe String -> [String]
+conversationMembersReqURL token channel Nothing =
+  [ slackAPI
+  , "conversations.members"
+  , "?limit=200&token="
+  , token
+  , "&channel="
+  , channel
+  ]
+conversationMembersReqURL token channel (Just cursor) =
+  conversationMembersReqURL token channel Nothing <> ["&cursor=", cursor]
+
+conversationMembersReq :: String -> String -> IO [String]
+conversationMembersReq token channel = do
+  resp <- doRequestConversationMembers $ concat $ conversationMembersReqURL
+    token
+    channel
+    Nothing
+  conversationMembersReq_ token channel resp
+
+conversationMembersReq_ :: String -> String -> MemberList -> IO [String]
+conversationMembersReq_ token channel (MemberList (Nothing, members)) =
+  return members
+conversationMembersReq_ token channel (MemberList (Just cursor, members)) = do
+  resp <- doRequestConversationMembers $ concat $ conversationMembersReqURL
+    token
+    channel
+    (Just cursor)
+  nextMembers <- conversationMembersReq_ token channel resp
+  return $ members <> nextMembers
+
+doRequestConversationMembers :: String -> IO MemberList
+doRequestConversationMembers url = do
+  resp <- HTTP.httpJSONEither $ HTTP.parseRequest_ url
+  case HTTP.getResponseBody resp of
+    Left err -> case HTTP.getResponseStatusCode resp of
+      429 -> do
+        let retryAfter = read
+              (B8.unpack (head (HTTP.getResponseHeader "Retry-After" resp)))
+        threadDelay $ retryAfter * 1000000
+        doRequestConversationMembers url
+      status -> error $ "uncatchable error: " <> show (status, err)
+    Right conversationMembersResp -> return conversationMembersResp

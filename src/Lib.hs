@@ -65,7 +65,7 @@ server = slackCmdResp
 
 slackCmdResp :: String -> B8.ByteString -> CmdReq -> Handler SlackCmdResp
 slackCmdResp token dbURL cmdReq = do
-  slackIDs <- liftIO $ Slack.channelSlackIDs token (channel_id cmdReq)
+  slackIDs <- liftIO $ Slack.conversationMembersReq token (channel_id cmdReq)
   tzs      <- liftIO $ Db.selectTimeZones dbURL slackIDs
   msgs     <- liftIO $ mapM Time.dbTimeZoneToTime tzs
   return $ SlackCmdResp $ intercalate "\n" msgs
